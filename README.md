@@ -1,1 +1,1 @@
-# coursera_pml_project
+# see https://giorgiog67.github.io/coursera_pml_project/
