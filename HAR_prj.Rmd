@@ -1,0 +1,286 @@
+---
+title: "HAR: Human Activities Recognition"
+author: "Giorgio Garziano"
+date: "December 2016"
+output: html_document
+---
+
+<style type="text/css">
+
+.table {
+    width: 50%;
+}
+
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+setwd("~/R/Coursera/Practical-Machine-Learning/week-4/prj")
+```
+
+
+### Abstract
+
+Human activities can be identified based on data collected by wearable devices. As outlined in reference [1], Velloso and others considered five activity classes, gathered from four subjects wearing accelerometers mounted on their waist, left thigh, right arm, and right ankle. The data so collected is made available in the dataset I am going to analyse and which is the starting point for Human Activity Recognition (HAR) classification model.
+
+
+### Exploratory Analysis
+
+I start by loading data from *pml-training.csv* and *pml-testing.csv* files. 
+
+The content of the *pml-testing.csv* file will be used only at the end to produce predictions as required.
+
+The content of the *pml-training.csv* will be split in an actual training set, used to train models, and a validation set, used to obtain accuracy estimation on unseen data.
+
+Further exploratory analysis will be performed in order to handle missing values, skewed and correlated predictors. Finally, the definitive set of predictors shall be set forth.
+
+The training set will be used to build two models, GBM and Random Forest based. Accuracy metrics will be computed for both training and validation datasets.
+
+Models comparison will be outlined and final choice made.
+
+* **Loading Data**
+
+In this section, I load the *pml_training.csv*, *pml_testing.csv* files content. 
+
+```{r, warning=FALSE}
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(caret))
+suppressPackageStartupMessages(library(e1071))
+set.seed(1023)
+
+URL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+download.file(URL, "pml-training.csv")
+har_training <- read.csv("pml-training.csv", header = TRUE, 
+                         stringsAsFactors = TRUE, na.strings = c("NA", "", "#DIV/0!"))
+dim(har_training)
+
+URL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(URL, "pml-testing.csv")
+har_testing <- read.csv("pml-testing.csv", header =TRUE, 
+                        stringsAsFactors = TRUE, na.strings = c("NA", "", "#DIV/0!"))
+dim(har_testing)
+```
+
+* **Missing Values**
+
+In this section, two issues about our datasets will be fixed:
+
++ columns not associated to predictors
+
++ missing values presence
+
+First issue is identified by first seven columns and solved by taken them out from the list of predictors.
+
+Second issue cannot be solved by the *knnImpute* caret package pre-processing option due to limits in finding a sufficient number of neighbours. A predictors set will be determined among the training and testing dataset after having taken out columns with all NA's values.
+
+I make sure to use the predictors available as columns of data inside the *har_testing* dataset.
+
+I then identify the shared columns (i.e. predictors) that can be used on the prosecution of the analysis.
+
+
+```{r, warning=FALSE, fig.align='center'}
+# columns 1:7 do not represent predictors
+colnames(har_training)[1:7]
+
+# taking out the columns 1:7
+har_training <- har_training[,-c(1:7)]
+har_testing <- har_testing[,-c(1:7)] 
+
+# training dataset "classe" outcome values frequencies
+table(har_training$classe)
+
+# restricting to shared columns between training and testing datasets
+# in order to use predictors in the training dataset that can 
+# also be found in the testing dataset
+shared_cols <- intersect(colnames(har_training), colnames(har_testing))
+har_training <- har_training[c(shared_cols, "classe")]
+har_testing <- har_testing[shared_cols]
+
+# columns with NA values
+l <- apply(har_testing, 2, function(x) sum(is.na(x)) > 0)
+
+# number of columns with NA values
+sum(l)
+
+# columns with NA values names
+cols_with_NA <- names(l)[l==TRUE]
+
+# computing shared columns names and number for both 
+# training and testing dataset
+col_test_names <- setdiff(colnames(har_testing), cols_with_NA)
+col_train_names <- intersect(colnames(har_training), col_test_names)
+col_test_names <- col_train_names
+col_train_names <- c(col_train_names, "classe")
+
+training_noNa_sh <- har_training[col_train_names]
+dim(training_noNa_sh)
+
+# columns with NA values in new training dataset
+l <- apply(training_noNa_sh, 2, function(x) sum(is.na(x)) > 0)
+sum(l)
+```
+
+Ultimately, our analysis goes on using the resulting *training_noNa_sh* dataset which does not have columns with NA values.
+
+
+* **Correlated Predictors**
+
+In this section, I investigate whether some of the predictors are remarkably correlated and need to be cut off from that role.
+
+```{r, warning=FALSE}
+training_noNa_num <- Filter(is.numeric, training_noNa_sh)
+s <- apply(training_noNa_num, 2, function(x) sum(abs(x)))
+col_zero <- which(s == 0)
+training_noNa_num_no_zero <- training_noNa_sh[-col_zero]
+
+corr_data <- cor(training_noNa_num_no_zero)
+(fc <- findCorrelation(corr_data, cutoff=0.8))
+col_to_rem <- colnames(training_noNa_num_no_zero[fc])
+col_to_keep <- setdiff(colnames(training_noNa_sh), col_to_rem)
+training <- training_noNa_sh[col_to_keep]
+```
+
+I have not identified any highly correlated predictors. I go on with our analysis using the *training* dataset.
+
+
+* **Predictors Skewness**
+
+In this section, I investigate skewed predictors presence.
+
+```{r, warning=FALSE}
+training_num <- Filter(is.numeric, training)
+skew <- apply(training_num, 2, skewness)
+summary(skew)
+
+boxcox_trans <- apply(training_num, 2, BoxCoxTrans)
+boxcox_trans$magnet_belt_y
+```
+
+For some predictors, a lambda different from zero is estimated, as in case of *magnet_belt_y*, for example. Therefore in the pre-processing options *BoxCox* is required.
+
+
+### Building Models
+
+* **Dataset Partitioning**
+
+Due to relative abundance of data, I choose a 60-40 balance between training and validation set.
+
+```{r, warning=FALSE}
+training_x <- subset(training, select = -classe)
+data_part <- createDataPartition(training$classe, p=0.6, list=FALSE)
+```
+
+In the following, I am going to build two models, one based on GBM and another on Random Forest. Their accuracy performance will be compared and a choice among the two will be made at the end.
+
+* **Cross-Validation set-up**
+
+I am going to take advantage of ten folds cross-validation for both models. I am not using *repeated* cross-validation due to laptop hardware limitations. 
+
+```{r, warning=FALSE, fig.align="center"}
+fitControl <- trainControl(method="cv", number=10, verboseIter=FALSE)
+```
+
+* **GBM Model**
+
+A grid of tuning parameters is used, which includes number of trees, interaction depth, shrinkage and minimum number of observations per node.
+
+```{r, warning=FALSE, fig.align="center"}
+grid <- expand.grid(n.trees = seq(150), 
+                    interaction.depth = c(10, 15), 
+                    shrinkage = c(.1, .15), 
+                    n.minobsinnode = 10)
+
+gbm_fit <- train(x = training_x[data_part,],
+             y = training[data_part,]$classe,
+             method = "gbm",
+             preProcess = c("BoxCox", "center", "scale", "nzv"),
+             trControl = fitControl,
+             tuneGrid = grid,
+             metric = 'Accuracy',
+             verbose = FALSE)
+gbm_fit
+plot(gbm_fit)
+
+gbm_varimp <- varImp(gbm_fit)$importance
+gbm_o <- order(gbm_varimp[,1], decreasing =TRUE)
+kable(gbm_varimp[gbm_o,, drop=FALSE], caption = "GBM Model Variables Importance")
+
+# confusion matrix based on training set
+confusionMatrix(predict(gbm_fit, newdata=training_x[data_part,]),
+                training[data_part,]$classe)
+
+# confusion matrix based on validation set
+(gbm_cmat <- confusionMatrix(predict(gbm_fit, newdata=training_x[-data_part,]), 
+                training[-data_part,]$classe))
+
+out_of_sample_err_perc <- round((1 - gbm_cmat$overall[1])*100, 2)
+```
+
+The expected out-of-sample error for the GBM model is `r out_of_sample_err_perc` %.
+
+
+* **Random Forest Model**
+
+The Random Forest model is build with the same number of trees as per GBM. The *tuneLength* parameter is set equal to 10 to drive the *mtry* choice.
+
+```{r, warning=FALSE, fig.align='center'}
+rf_fit <- train(x = training_x[data_part,],
+                y = training[data_part,]$classe,
+                method = "rf",
+                preProcess = c("center", "scale", "nzv"),
+                trControl = fitControl,
+                ntree = 150,
+                tuneLength = 10,
+                metric = 'Accuracy',
+                verbose = FALSE)
+rf_fit
+plot(rf_fit)
+
+rf_varimp <- varImp(rf_fit)$importance
+rf_o <- order(rf_varimp[,1], decreasing =TRUE)
+kable(rf_varimp[rf_o,, drop=FALSE], caption = "RF Model Variables Importance")
+
+# confusion matrix based on training set
+confusionMatrix(predict(rf_fit, newdata=training_x[data_part,]),
+                training[data_part,]$classe)
+
+# confusion matrix based on validation set
+(rf_cmat <- confusionMatrix(predict(rf_fit, newdata=training_x[-data_part,]), 
+                training[-data_part,]$classe))
+
+out_of_sample_err_perc <- round((1 - rf_cmat$overall[1])*100, 2)
+```
+
+The expected out-of-sample error for the Random Forest model is `r out_of_sample_err_perc` %.
+
+
+### Models Comparison
+
+```{r, warning=FALSE, fig.align='center'}
+resamps <- resamples(list(GBM = gbm_fit, RF = rf_fit))
+summary(resamps)
+bwplot(resamps, layout = c(2, 1))
+```
+
+The GBM model, which has a slightly better accuracy performance than the Random Forest one, is choosen as final model.
+
+
+### Test Set Predictions
+
+Herein below, required test set predictions are shown.
+
+```{r, warning=FALSE, echo=FALSE}
+save(gbm_fit, rf_fit, training, har_testing, file="har.RData")
+```
+
+```{r, warning=FALSE, fig.align='center'}
+predict(gbm_fit, har_testing[col_test_names])
+```
+
+
+### References
+
+1. [Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13), Stuttgart, Germany: ACM SIGCHI, 2013.](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201)
